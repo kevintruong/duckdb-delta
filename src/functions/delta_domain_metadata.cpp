@@ -48,10 +48,10 @@ static unique_ptr<FunctionData> DeltaDomainMetadataBind(ClientContext &context, 
 	{
 		auto snapshot_ref = file_list->snapshot->GetLockingRef();
 		bool has_metadata;
-		auto error = KernelUtils::TryUnpackResult(ffi::visit_domain_metadata(snapshot_ref.GetPtr(),
-		                                                                     file_list->extern_engine.get(),
-		                                                                     &visitor_data, DomainMetadataVisitor),
-		                                          has_metadata);
+		auto error =
+		    KernelUtils::TryUnpackResult(ffi::visit_domain_metadata(snapshot_ref.GetPtr(), file_list->GetEngine(),
+		                                                            &visitor_data, DomainMetadataVisitor),
+		                                 has_metadata);
 		if (error.HasError()) {
 			error.Throw();
 		}

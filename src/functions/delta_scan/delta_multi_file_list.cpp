@@ -11,6 +11,7 @@
 #include "duckdb/logging/logger.hpp"
 #include "duckdb/function/table_function.hpp"
 #include "duckdb/main/client_data.hpp"
+#include "duckdb/main/client_context_state.hpp"
 #include "duckdb/main/extension_helper.hpp"
 #include "duckdb/main/query_profiler.hpp"
 #include "duckdb/main/secret/secret_manager.hpp"
@@ -27,6 +28,13 @@
 #include <regex>
 #include <algorithm>
 #include <cstdlib>
+
+#ifdef __APPLE__
+#include <SystemConfiguration/SystemConfiguration.h>
+#elif defined(_WIN32)
+#include "duckdb/common/windows.hpp"
+#include <array>
+#endif
 
 #include "duckdb/planner/constraints/bound_not_null_constraint.hpp"
 
@@ -71,25 +79,22 @@ static string parseFromConnectionString(const string &connectionString, const st
 	return "";
 }
 
-static ffi::ExclusiveEngineBuilder *CreateBuilder(ClientContext &context, const string &path) {
-	ffi::ExclusiveEngineBuilder *builder;
+struct DeltaEngineConfig {
+	string path;
+	vector<pair<string, string>> options;
+	bool reusable = false;
+};
+
+static DeltaEngineConfig GetDeltaEngineConfig(ClientContext &context, const string &path) {
+	DeltaEngineConfig config;
+	config.path = path;
 
 	// For "regular" paths we early out with the default builder config
 	if (!StringUtil::StartsWith(path, "s3://") && !StringUtil::StartsWith(path, "gcs://") &&
 	    !StringUtil::StartsWith(path, "gs://") && !StringUtil::StartsWith(path, "r2://") &&
 	    !StringUtil::StartsWith(path, "azure://") && !StringUtil::StartsWith(path, "az://") &&
 	    !StringUtil::StartsWith(path, "abfs://") && !StringUtil::StartsWith(path, "abfss://")) {
-		auto interface_builder_res =
-		    ffi::get_engine_builder(KernelUtils::ToDeltaString(path), DuckDBEngineError::AllocateError);
-
-		ffi::ExclusiveEngineBuilder *return_value;
-		auto res = KernelUtils::TryUnpackResult(interface_builder_res, return_value);
-		if (res.HasError()) {
-			res.Throw();
-		}
-		// Use multi-threaded tokio executor (required for checkpoint support)
-		return_value = ffi::builder_with_multithreaded_executor(return_value, 0, 0);
-		return return_value;
+		return config;
 	}
 
 	string bucket;
@@ -184,23 +189,10 @@ static ffi::ExclusiveEngineBuilder *CreateBuilder(ClientContext &context, const 
 	// We need to substitute DuckDB's usage of s3 and r2 paths because delta kernel needs to just interpret them as s3
 	// protocol servers. GCS goes the same way unless a bearer token sends it to the native store, where gcs:// has to
 	// be spelled gs:// because that is the only form GoogleCloudStorageBuilder::with_url recognizes.
-	string cleaned_path;
-	if (StringUtil::StartsWith(path, "r2://")) {
-		cleaned_path = "s3://" + path.substr(5);
-	} else if (StringUtil::StartsWith(path, "gs://")) {
-		cleaned_path = gcs_bearer ? path : "s3://" + path.substr(5);
+	if (StringUtil::StartsWith(path, "r2://") || (StringUtil::StartsWith(path, "gs://") && !gcs_bearer)) {
+		config.path = "s3://" + path.substr(5);
 	} else if (StringUtil::StartsWith(path, "gcs://")) {
-		cleaned_path = (gcs_bearer ? string("gs://") : string("s3://")) + path.substr(6);
-	} else {
-		cleaned_path = path;
-	}
-
-	auto interface_builder_res =
-	    ffi::get_engine_builder(KernelUtils::ToDeltaString(cleaned_path), DuckDBEngineError::AllocateError);
-
-	auto res = KernelUtils::TryUnpackResult(interface_builder_res, builder);
-	if (res.HasError()) {
-		res.Throw();
+		config.path = (gcs_bearer ? string("gs://") : string("s3://")) + path.substr(6);
 	}
 
 	// No secret: nothing left to do here!
@@ -212,27 +204,13 @@ static ffi::ExclusiveEngineBuilder *CreateBuilder(ClientContext &context, const 
 			    "create an R2 or GCS secret containing the credentials for this endpoint and try again.");
 		}
 
-		// Use multi-threaded tokio executor (required for checkpoint support)
-		builder = ffi::builder_with_multithreaded_executor(builder, 0, 0);
-		return builder;
+		return config;
 	}
 	const auto &kv_secret = *matched_secret;
 	auto &secret_reader = *matched_secret_reader;
 
-	// Here you would need to add the logic for setting the builder options for Azure
-	// This is just a placeholder and will need to be replaced with the actual logic
-	// builder_with_option consumes the builder it is given and hands back the updated one; on error the
-	// kernel has already dropped it, so the caller's handle is cleared rather than left dangling.
-	auto set_option = [](ffi::ExclusiveEngineBuilder *&builder, const string &key, const string &value) {
-		ffi::ExclusiveEngineBuilder *updated;
-		auto err = KernelUtils::TryUnpackResult(
-		    ffi::builder_with_option(builder, KernelUtils::ToDeltaString(key), KernelUtils::ToDeltaString(value)),
-		    updated);
-		if (err.HasError()) {
-			builder = nullptr;
-			err.Throw();
-		}
-		builder = updated;
+	auto set_option = [&](const string &key, const string &value) {
+		config.options.emplace_back(key, value);
 	};
 
 	if (gcs_bearer) {
@@ -240,7 +218,7 @@ static ffi::ExclusiveEngineBuilder *CreateBuilder(ClientContext &context, const 
 		// key without an error, so the request goes out without the token: do not backport below kernel v0.30.
 		// The token is static: it is the pre-issued OAuth token (as Unity Catalog vends for GCP), and nothing here
 		// refreshes it when it expires.
-		set_option(builder, "bearer_token", bearer_token);
+		set_option("bearer_token", bearer_token);
 
 		// ENDPOINT (an emulator or private endpoint) becomes the native store's base URL, with USE_SSL choosing the
 		// scheme as on the S3 path. REGION and URL_STYLE mean nothing to the native GCS API (and may hold httpfs
@@ -254,9 +232,9 @@ static ffi::ExclusiveEngineBuilder *CreateBuilder(ClientContext &context, const 
 				endpoint = (use_ssl ? "https://" : "http://") + endpoint;
 			}
 			if (StringUtil::StartsWith(endpoint, "http://")) {
-				set_option(builder, "allow_http", "true");
+				set_option("allow_http", "true");
 			}
-			set_option(builder, "google_base_url", endpoint);
+			set_option("google_base_url", endpoint);
 		}
 	} else if (secret_type == "s3" || secret_type == "gcs" || secret_type == "r2") {
 		string key_id, secret, session_token, region, endpoint, url_style;
@@ -269,18 +247,20 @@ static ffi::ExclusiveEngineBuilder *CreateBuilder(ClientContext &context, const 
 		secret_reader.TryGetSecretKey("url_style", url_style);
 		secret_reader.TryGetSecretKey("use_ssl", use_ssl);
 
+		// A provider outside DuckDB may refresh credentials independently of the secret.
+		config.reusable = secret_type == "s3" && !key_id.empty() && !secret.empty();
 		if (key_id.empty() && secret.empty()) {
-			set_option(builder, "skip_signature", "true");
+			set_option("skip_signature", "true");
 		}
 
 		if (!key_id.empty()) {
-			set_option(builder, "aws_access_key_id", key_id);
+			set_option("aws_access_key_id", key_id);
 		}
 		if (!secret.empty()) {
-			set_option(builder, "aws_secret_access_key", secret);
+			set_option("aws_secret_access_key", secret);
 		}
 		if (!session_token.empty()) {
-			set_option(builder, "aws_session_token", session_token);
+			set_option("aws_session_token", session_token);
 		}
 		if (!endpoint.empty() && endpoint != "s3.amazonaws.com") {
 			if (!StringUtil::StartsWith(endpoint, "https://") && !StringUtil::StartsWith(endpoint, "http://")) {
@@ -292,18 +272,18 @@ static ffi::ExclusiveEngineBuilder *CreateBuilder(ClientContext &context, const 
 			}
 
 			if (StringUtil::StartsWith(endpoint, "http://")) {
-				set_option(builder, "allow_http", "true");
+				set_option("allow_http", "true");
 			}
-			set_option(builder, "aws_endpoint", endpoint);
+			set_option("aws_endpoint", endpoint);
 		} else if (StringUtil::StartsWith(path, "gs://") || StringUtil::StartsWith(path, "gcs://")) {
-			set_option(builder, "aws_endpoint", "https://storage.googleapis.com");
+			set_option("aws_endpoint", "https://storage.googleapis.com");
 		}
 		if (secret_type == "s3") {
 			if (!url_style.empty() && url_style == "vhost") {
-				set_option(builder, "aws_virtual_hosted_style_request", "true");
+				set_option("aws_virtual_hosted_style_request", "true");
 			}
 		}
-		set_option(builder, "aws_region", region);
+		set_option("aws_region", region);
 
 	} else if (secret_type == "azure") {
 		// azure seems to be super complicated as we need to cover duckdb azure plugin and delta RS builder
@@ -318,7 +298,7 @@ static ffi::ExclusiveEngineBuilder *CreateBuilder(ClientContext &context, const 
 		secret_reader.TryGetSecretKey("chain", chain);
 
 		if (!account_name.empty() && account_name == "onelake") {
-			set_option(builder, "use_fabric_endpoint", "true");
+			set_option("use_fabric_endpoint", "true");
 		}
 
 		auto provider = kv_secret.GetProvider();
@@ -330,11 +310,11 @@ static ffi::ExclusiveEngineBuilder *CreateBuilder(ClientContext &context, const 
 			if (access_token.empty()) {
 				throw InvalidInputException("No access_token value not found in secret provider!");
 			}
-			set_option(builder, "bearer_token", access_token);
+			set_option("bearer_token", access_token);
 		} else if (provider == "credential_chain") {
 			// Authentication option 1a: using the cli authentication
 			if (chain.find("cli") != std::string::npos) {
-				set_option(builder, "use_azure_cli", "true");
+				set_option("use_azure_cli", "true");
 			}
 			// Authentication option 1b: using a workload_identity w/ AZURE_FEDERATED_TOKEN_FILE
 			// as required trigger. Fail if common vars client_id or tenant_id missing.
@@ -349,9 +329,9 @@ static ffi::ExclusiveEngineBuilder *CreateBuilder(ClientContext &context, const 
 						throw InvalidInputException("Azure workload_identity requires AZURE_CLIENT_ID and "
 						                            "AZURE_TENANT_ID in environment.");
 					} else {
-						set_option(builder, "federated_token_file", env_fed_token);
-						set_option(builder, "azure_client_id", env_client_id);
-						set_option(builder, "azure_tenant_id", env_tenant_id);
+						set_option("federated_token_file", env_fed_token);
+						set_option("azure_client_id", env_client_id);
+						set_option("azure_tenant_id", env_tenant_id);
 					}
 				}
 			}
@@ -363,7 +343,7 @@ static ffi::ExclusiveEngineBuilder *CreateBuilder(ClientContext &context, const 
 			account_name = parseFromConnectionString(connection_string, "AccountName");
 			// Authentication option 2: a connection string based on account key
 			if (!account_name.empty() && !account_key.empty()) {
-				set_option(builder, "account_key", account_key);
+				set_option("account_key", account_key);
 			} else {
 				// Authentication option 2b: a connection string based on SAS token
 				endpoint = parseFromConnectionString(connection_string, "BlobEndpoint");
@@ -372,49 +352,235 @@ static ffi::ExclusiveEngineBuilder *CreateBuilder(ClientContext &context, const 
 				}
 				auto sas_token = parseFromConnectionString(connection_string, "SharedAccessSignature");
 				if (!sas_token.empty()) {
-					set_option(builder, "sas_token", sas_token);
+					set_option("sas_token", sas_token);
 				}
 			}
 		} else if (provider == "service_principal") {
 			if (!client_id.empty()) {
-				set_option(builder, "azure_client_id", client_id);
+				set_option("azure_client_id", client_id);
 			}
 			if (!client_secret.empty()) {
-				set_option(builder, "azure_client_secret", client_secret);
+				set_option("azure_client_secret", client_secret);
 			}
 			if (!tenant_id.empty()) {
-				set_option(builder, "azure_tenant_id", tenant_id);
+				set_option("azure_tenant_id", tenant_id);
 			}
 		} else {
 			// Authentication option 3: no authentication, just an account name
-			set_option(builder, "azure_skip_signature", "true");
+			set_option("azure_skip_signature", "true");
 		}
 		// Set the use_emulator option for when the azurite test server is used
 		if (account_name == "devstoreaccount1" || connection_string.find("devstoreaccount1") != string::npos) {
-			set_option(builder, "use_emulator", "true");
+			set_option("use_emulator", "true");
 		}
 		if (!account_name.empty()) {
-			set_option(builder, "account_name", account_name); // needed for delta RS builder
+			set_option("account_name", account_name); // needed for delta RS builder
 		}
 		if (!endpoint.empty()) {
-			set_option(builder, "azure_endpoint", endpoint);
+			set_option("azure_endpoint", endpoint);
 		}
-		set_option(builder, "container_name", bucket);
+		set_option("container_name", bucket);
 	}
-	// Use multi-threaded tokio executor (required for checkpoint support)
-	builder = ffi::builder_with_multithreaded_executor(builder, 0, 0);
-	return builder;
+	return config;
 }
 
-KernelExternEngine CreateDeltaEngine(ClientContext &context, const string &path) {
-	auto interface_builder = CreateBuilder(context, path);
+static KernelExternEngine BuildDeltaEngine(const DeltaEngineConfig &config) {
+	ffi::ExclusiveEngineBuilder *builder;
+	auto res = KernelUtils::TryUnpackResult(
+	    ffi::get_engine_builder(KernelUtils::ToDeltaString(config.path), DuckDBEngineError::AllocateError), builder);
+	if (res.HasError()) {
+		res.Throw();
+	}
+	for (const auto &option : config.options) {
+		// The kernel consumes the old builder even if applying the option fails.
+		auto err =
+		    KernelUtils::TryUnpackResult(ffi::builder_with_option(builder, KernelUtils::ToDeltaString(option.first),
+		                                                          KernelUtils::ToDeltaString(option.second)),
+		                                 builder);
+		if (err.HasError()) {
+			err.Throw();
+		}
+	}
+	// Use the multi-threaded Tokio executor required for checkpoints.
+	builder = ffi::builder_with_multithreaded_executor(builder, 0, 0);
+
 	ffi::SharedExternEngine *engine;
-	auto res = KernelUtils::TryUnpackResult(ffi::builder_build(interface_builder), engine);
+	res = KernelUtils::TryUnpackResult(ffi::builder_build(builder), engine);
 	if (res.HasError()) {
 		res.Throw();
 	}
 	return KernelExternEngine(engine);
 }
+
+KernelExternEngine CreateDeltaEngine(ClientContext &context, const string &path) {
+	return BuildDeltaEngine(GetDeltaEngineConfig(context, path));
+}
+
+struct DeltaProxyConfig {
+	bool Capture() {
+		// Match the environment inputs to the Kernel HTTP client's proxy matcher.
+		static constexpr const char *variables[] = {"ALL_PROXY",  "all_proxy",   "HTTP_PROXY",
+		                                            "http_proxy", "HTTPS_PROXY", "https_proxy",
+		                                            "NO_PROXY",   "no_proxy",    "REQUEST_METHOD"};
+		for (const auto *variable : variables) {
+#ifdef _WIN32
+			if (!CaptureWindowsEnvironment(variable)) {
+				return false;
+			}
+#else
+			if (auto value = std::getenv(variable)) {
+				environment.emplace_back(variable, value);
+			}
+#endif
+		}
+
+#ifdef __APPLE__
+		system_config.reset(SCDynamicStoreCopyProxies(nullptr));
+		return system_config != nullptr;
+#elif defined(_WIN32)
+		return CaptureWindowsRegistry();
+#else
+		return true;
+#endif
+	}
+
+	bool operator==(const DeltaProxyConfig &other) const {
+		if (environment != other.environment) {
+			return false;
+		}
+#ifdef __APPLE__
+		if (system_config && other.system_config) {
+			return CFEqual(system_config.get(), other.system_config.get());
+		}
+		return system_config.get() == other.system_config.get();
+#elif defined(_WIN32)
+		return system_config == other.system_config;
+#else
+		return true;
+#endif
+	}
+
+private:
+	vector<pair<string, string>> environment;
+#ifdef __APPLE__
+	std::unique_ptr<const __CFDictionary, decltype(&CFRelease)> system_config {nullptr, &CFRelease};
+#elif defined(_WIN32)
+	bool CaptureWindowsEnvironment(const string &name) {
+		const std::wstring wide_name(name.begin(), name.end());
+		SetLastError(ERROR_SUCCESS);
+		const auto length = GetEnvironmentVariableW(wide_name.c_str(), nullptr, 0);
+		if (!length) {
+			const auto error = GetLastError();
+			if (error == ERROR_ENVVAR_NOT_FOUND) {
+				return true;
+			}
+			if (error != ERROR_SUCCESS) {
+				return false;
+			}
+			environment.emplace_back(name, string());
+			return true;
+		}
+
+		std::wstring value(length, L'\0');
+		SetLastError(ERROR_SUCCESS);
+		const auto copied = GetEnvironmentVariableW(wide_name.c_str(), &value[0], length);
+		if (copied >= length || (!copied && GetLastError() != ERROR_SUCCESS)) {
+			return false;
+		}
+		environment.emplace_back(name, string(reinterpret_cast<const char *>(value.data()), copied * sizeof(wchar_t)));
+		return true;
+	}
+
+	bool CaptureWindowsRegistry() {
+		static constexpr const wchar_t *key = L"Software\\Microsoft\\Windows\\CurrentVersion\\Internet Settings";
+		static constexpr const wchar_t *names[] = {L"ProxyEnable", L"ProxyServer", L"ProxyOverride"};
+		for (idx_t index = 0; index < system_config.size(); index++) {
+			DWORD size = 0;
+			DWORD type = 0;
+			const auto flags = RRF_RT_ANY | RRF_NOEXPAND;
+			const auto status = RegGetValueW(HKEY_CURRENT_USER, key, names[index], flags, &type, nullptr, &size);
+			if (status == ERROR_FILE_NOT_FOUND) {
+				continue;
+			}
+			if (status != ERROR_SUCCESS) {
+				return false;
+			}
+			string value(size, '\0');
+			if (size &&
+			    RegGetValueW(HKEY_CURRENT_USER, key, names[index], flags, &type, &value[0], &size) != ERROR_SUCCESS) {
+				return false;
+			}
+			value.resize(size);
+			system_config[index] = make_pair(type, std::move(value));
+		}
+		return true;
+	}
+
+	std::array<pair<DWORD, string>, 3> system_config {};
+#endif
+};
+
+struct DeltaEngineCache {
+	shared_ptr<KernelExternEngine> GetOrCreate(DeltaEngineConfig config) {
+		DeltaProxyConfig proxy;
+		config.reusable = config.reusable && proxy.Capture();
+		lock_guard<mutex> guard(lock);
+		if (config.reusable && engine && last_config.path == config.path && last_config.options == config.options &&
+		    last_proxy == proxy) {
+			return engine;
+		}
+		auto new_engine = make_shared_ptr<KernelExternEngine>();
+		*new_engine = BuildDeltaEngine(config);
+		if (config.reusable) {
+			last_config = std::move(config);
+			last_proxy = std::move(proxy);
+			engine = new_engine;
+		} else {
+			ClearLocked();
+		}
+		return new_engine;
+	}
+
+	void Clear() {
+		lock_guard<mutex> guard(lock);
+		ClearLocked();
+	}
+
+private:
+	void ClearLocked() {
+		last_config = {};
+		last_proxy = {};
+		engine.reset();
+	}
+
+	mutex lock;
+	DeltaEngineConfig last_config;
+	DeltaProxyConfig last_proxy;
+	shared_ptr<KernelExternEngine> engine;
+};
+
+class DeltaEngineCacheOwner : public ClientContextState {
+public:
+	void Track(const shared_ptr<DeltaEngineCache> &cache) {
+		lock_guard<mutex> guard(lock);
+		caches.erase(std::remove_if(caches.begin(), caches.end(),
+		                            [](const weak_ptr<DeltaEngineCache> &entry) { return entry.expired(); }),
+		             caches.end());
+		caches.emplace_back(cache);
+	}
+
+	~DeltaEngineCacheOwner() override {
+		for (const auto &entry : caches) {
+			if (auto cache = entry.lock()) {
+				cache->Clear();
+			}
+		}
+	}
+
+private:
+	mutex lock;
+	vector<weak_ptr<DeltaEngineCache>> caches;
+};
 
 struct KernelPartitionVisitorData {
 	vector<string> partitions;
@@ -584,7 +750,7 @@ void ScanDataCallBack::VisitCallbackInternal(ffi::NullableCvoid engine_context, 
 
 	if (dv_info->has_vector) {
 		// Fetch the deletion vector
-		auto selection_vector_res = ffi::selection_vector_from_dv(dv_info->info, snapshot.extern_engine.get(),
+		auto selection_vector_res = ffi::selection_vector_from_dv(dv_info->info, snapshot.GetEngine(),
 		                                                          KernelUtils::ToDeltaString(snapshot.root_path));
 
 		ffi::KernelBoolSlice selection_vector;
@@ -654,8 +820,8 @@ void ScanDataCallBack::VisitData(ffi::NullableCvoid engine_context,
 	// scan_metadata_next transfers ownership; visit_scan_metadata only borrows it.
 	KernelScanMetadata scan_metadata(scan_metadata_raw);
 	auto scandata_cb = static_cast<ScanDataCallBack *>(engine_context);
-	auto res = ffi::visit_scan_metadata(scan_metadata.get(), scandata_cb->snapshot.extern_engine.get(), engine_context,
-	                                    VisitCallback);
+	auto res =
+	    ffi::visit_scan_metadata(scan_metadata.get(), scandata_cb->snapshot.GetEngine(), engine_context, VisitCallback);
 	bool ok;
 	auto err = KernelUtils::TryUnpackResult(res, ok);
 	if (err.HasError()) {
@@ -664,7 +830,7 @@ void ScanDataCallBack::VisitData(ffi::NullableCvoid engine_context,
 }
 
 DeltaMultiFileList::DeltaMultiFileList(ClientContext &context_p, const string &path_p, idx_t version_p,
-                                       optional_ptr<const DeltaMultiFileList> previous)
+                                       optional_ptr<const DeltaMultiFileList> previous, bool cache_engine)
     : SimpleMultiFileList({ToDeltaPath(path_p)}), version(version_p) {
 	// delta-kernel resolves the table location using its own file and HTTP I/O, outside of the file systems of DuckDB,
 	// so check the file access settings here before that happens
@@ -678,6 +844,11 @@ DeltaMultiFileList::DeltaMultiFileList(ClientContext &context_p, const string &p
 		old_snapshot = previous->snapshot;
 	}
 	client_ctx = weak_ptr<ClientContext>(context_p.shared_from_this());
+	if (cache_engine && StringUtil::StartsWith(paths[0].path, "s3://")) {
+		engine_cache = make_shared_ptr<DeltaEngineCache>();
+		// A pinned catalog entry can outlive the connection allowed to reuse this engine.
+		context_p.registered_state->GetOrCreate<DeltaEngineCacheOwner>("delta_engine_cache_owner")->Track(engine_cache);
+	}
 }
 
 string DeltaMultiFileList::GetPath() const {
@@ -836,7 +1007,7 @@ void DeltaMultiFileList::Bind(vector<LogicalType> &return_types, vector<Identifi
 	{
 		auto snapshot_ref = snapshot->GetLockingRef();
 		visited_schema =
-		    KernelSchemaVisitor::ToColumnDefinitions(extern_engine.get(), snapshot_ref.GetPtr(), column_mapping_mode);
+		    KernelSchemaVisitor::ToColumnDefinitions(GetEngine(), snapshot_ref.GetPtr(), column_mapping_mode);
 	}
 
 	for (const auto &field : visited_schema) {
@@ -938,14 +1109,13 @@ ffi::Handle<ffi::ExclusiveSnapshotBuilder> DeltaMultiFileList::CreateSnapshotBui
 		if (target_version == DConstants::INVALID_INDEX || target_version >= old_version) {
 			// Going forward (or HEAD): use old snapshot as hint
 			using_incremental = true;
-			builder =
-			    TryUnpackKernelResult(ffi::get_snapshot_builder_from(old_snapshot_ref.GetPtr(), extern_engine.get()));
+			builder = TryUnpackKernelResult(ffi::get_snapshot_builder_from(old_snapshot_ref.GetPtr(), GetEngine()));
 		} else {
 			// Going backward: kernel rejects builder_from for older versions
-			builder = TryUnpackKernelResult(ffi::get_snapshot_builder(path_slice, extern_engine.get()));
+			builder = TryUnpackKernelResult(ffi::get_snapshot_builder(path_slice, GetEngine()));
 		}
 	} else {
-		builder = TryUnpackKernelResult(ffi::get_snapshot_builder(path_slice, extern_engine.get()));
+		builder = TryUnpackKernelResult(ffi::get_snapshot_builder(path_slice, GetEngine()));
 	}
 
 	if (target_version != DConstants::INVALID_INDEX) {
@@ -970,7 +1140,7 @@ idx_t DeltaMultiFileList::VersionAsOf(ClientContext &context, SharedKernelSnapsh
 	{
 		auto head_ref = head.GetLockingRef();
 		head_version = ffi::version(head_ref.GetPtr());
-		commit = TryUnpackKernelResult(ffi::latest_version_as_of(head_ref.GetPtr(), extern_engine.get(), timestamp_ms,
+		commit = TryUnpackKernelResult(ffi::latest_version_as_of(head_ref.GetPtr(), GetEngine(), timestamp_ms,
 		                                                         ffi::FfiHistoryCommitType::Recreatable));
 	}
 	auto resolved = static_cast<idx_t>(commit.version);
@@ -1022,7 +1192,12 @@ void DeltaMultiFileList::InitializeSnapshot() const {
 	auto client_ctx_shared = client_ctx.lock();
 	auto path_slice = KernelUtils::ToDeltaString(paths[0].path);
 
-	extern_engine = CreateDeltaEngine(*client_ctx_shared, paths[0].path);
+	if (engine_cache) {
+		extern_engine = engine_cache->GetOrCreate(GetDeltaEngineConfig(*client_ctx_shared, paths[0].path));
+	} else {
+		extern_engine = make_shared_ptr<KernelExternEngine>();
+		*extern_engine = CreateDeltaEngine(*client_ctx_shared, paths[0].path);
+	}
 
 	if (!snapshot && has_requested_timestamp) {
 		version = ResolveTimestamp(*client_ctx_shared, path_slice, requested_timestamp_ms);
@@ -1059,7 +1234,7 @@ void DeltaMultiFileList::InitializeScan() const {
 
 	// Create Scan
 	PredicateVisitor visitor(global_columns, &table_filters);
-	scan = TryUnpackKernelResult(ffi::scan(snapshot_ref.GetPtr(), extern_engine.get(), &visitor, nullptr));
+	scan = TryUnpackKernelResult(ffi::scan(snapshot_ref.GetPtr(), GetEngine(), &visitor, nullptr));
 
 	if (visitor.error_data.HasError()) {
 		throw IOException("Failed to initialize Scan for Delta table at '%s'. Original error: '%s'", paths[0].path,
@@ -1076,7 +1251,7 @@ void DeltaMultiFileList::InitializeScan() const {
 	delete static_cast<string *>(ptr);
 
 	// Create scan data iterator
-	scan_data_iterator = TryUnpackKernelResult(ffi::scan_metadata_iter_init(extern_engine.get(), scan.get()));
+	scan_data_iterator = TryUnpackKernelResult(ffi::scan_metadata_iter_init(GetEngine(), scan.get()));
 
 	// Load partitions
 	auto partition_count = ffi::get_partition_column_count(snapshot_ref.GetPtr());
@@ -1102,8 +1277,7 @@ void DeltaMultiFileList::InitializeScan() const {
 		}
 	}
 
-	lazy_loaded_schema =
-	    KernelSchemaVisitor::ToColumnDefinitions(extern_engine.get(), scan.get(), true, column_mapping_mode);
+	lazy_loaded_schema = KernelSchemaVisitor::ToColumnDefinitions(GetEngine(), scan.get(), true, column_mapping_mode);
 	resolve_by_field_id = DeltaMultiFileColumnDefinition::ResolveByFieldId(lazy_loaded_schema, column_mapping_mode);
 
 	DeltaMultiFileColumnDefinition::Print(lazy_loaded_schema, "lazy_loaded_schema");
@@ -1161,6 +1335,9 @@ unique_ptr<DeltaMultiFileList> DeltaMultiFileList::PushdownInternal(ClientContex
 	{
 		unique_lock<mutex> lck(lock);
 		filtered_list->snapshot = snapshot;
+		if (engine_cache && client_ctx.lock().get() == &context) {
+			filtered_list->engine_cache = engine_cache;
+		}
 	}
 
 	return filtered_list;
@@ -1471,7 +1648,7 @@ vector<DeltaStringWidthBound> DeltaMultiFileList::GetStringWidthBounds() const {
 		// through to an empty result: a width check that silently finds no bounds is the one failure we cannot see.
 		auto snapshot_ref = snapshot->GetLockingRef();
 		auto visited_schema =
-		    KernelSchemaVisitor::ToColumnDefinitions(extern_engine.get(), snapshot_ref.GetPtr(), column_mapping_mode);
+		    KernelSchemaVisitor::ToColumnDefinitions(GetEngine(), snapshot_ref.GetPtr(), column_mapping_mode);
 		vector<DeltaStringWidthBound> bounds;
 		ExtractStringWidthBounds(bounds, visited_schema);
 		return bounds;

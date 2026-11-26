@@ -106,13 +106,15 @@ struct DeltaStringWidthBound {
 	optional_idx max_length;
 };
 
+struct DeltaEngineCache;
+
 //! The DeltaMultiFileList implements the MultiFileList API to allow injecting it into the regular DuckDB parquet scan
 class DeltaMultiFileList : public SimpleMultiFileList {
 	friend struct ScanDataCallBack;
 
 public:
 	DeltaMultiFileList(ClientContext &context, const string &path, idx_t version,
-	                   optional_ptr<const DeltaMultiFileList> previous = nullptr);
+	                   optional_ptr<const DeltaMultiFileList> previous = nullptr, bool cache_engine = false);
 	string GetPath() const;
 	static string ToDuckDBPath(const string &raw_path);
 	static string ToDeltaPath(const string &raw_path);
@@ -199,7 +201,10 @@ public: // TODO: clean up
 		return return_value;
 	}
 
-	mutable KernelExternEngine extern_engine;
+	ffi::SharedExternEngine *GetEngine() const {
+		return extern_engine->get();
+	}
+
 	mutable shared_ptr<SharedKernelSnapshot> snapshot;
 
 	mutable unique_ptr<DeltaLogPathArray> delta_log_path;
@@ -216,6 +221,8 @@ protected:
 	mutable int64_t requested_timestamp_ms = 0;
 
 	//! Delta Kernel Structures
+	shared_ptr<DeltaEngineCache> engine_cache;
+	mutable shared_ptr<KernelExternEngine> extern_engine;
 	mutable shared_ptr<SharedKernelSnapshot> old_snapshot;
 
 	mutable KernelScan scan;

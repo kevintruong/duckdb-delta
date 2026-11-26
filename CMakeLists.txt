@@ -53,6 +53,7 @@ elseif(UNIX)
 elseif(WIN32)
   set(PLATFORM_LIBS
       ntdll
+      advapi32
       crypt32
       ncrypt
       secur32

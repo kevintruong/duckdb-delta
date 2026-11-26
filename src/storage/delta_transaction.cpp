@@ -420,8 +420,8 @@ void DeltaTransaction::Commit(ClientContext &context) {
 				auto &snapshot = *table_entry->snapshot;
 				auto kernel_snapshot = snapshot.snapshot->GetLockingRef();
 				auto app_id_kernel_string = KernelUtils::ToDeltaString(app_id);
-				auto get_app_id_version_result = ffi::get_app_id_version(kernel_snapshot.GetPtr(), app_id_kernel_string,
-				                                                         snapshot.extern_engine.get());
+				auto get_app_id_version_result =
+				    ffi::get_app_id_version(kernel_snapshot.GetPtr(), app_id_kernel_string, snapshot.GetEngine());
 
 				ffi::OptionalValue<int64_t> version_actual_opt;
 				auto unpacked_version_result =
@@ -455,7 +455,7 @@ void DeltaTransaction::Commit(ClientContext &context) {
 				kernel_transaction =
 				    table_entry->snapshot->TryUnpackKernelResult(ffi::update_table_txn_with_transaction_id(
 				        kernel_transaction.release(), KernelUtils::ToDeltaString(app_id),
-				        NumericCast<int64_t>(new_version), table_entry->snapshot->extern_engine.get()));
+				        NumericCast<int64_t>(new_version), table_entry->snapshot->GetEngine()));
 			}
 
 			// We have some special error handling here to ensure the error created by DuckDB is properly thrown here,
@@ -465,7 +465,7 @@ void DeltaTransaction::Commit(ClientContext &context) {
 			DUCKDB_LOG_INTERNAL(context, "delta.Commit", LogLevel::LOG_DEBUG, "Committing %s",
 			                    table_entry->snapshot->GetPath());
 			auto res = KernelUtils::TryUnpackResult(
-			    ffi::update_table_txn_commit(kernel_transaction.release(), table_entry->snapshot->extern_engine.get()),
+			    ffi::update_table_txn_commit(kernel_transaction.release(), table_entry->snapshot->GetEngine()),
 			    commit_result);
 			if (res.HasError()) {
 				if (active_error.HasError()) {
@@ -526,7 +526,7 @@ void DeltaTransaction::InitializeTransaction(ClientContext &context) {
 
 	{
 		auto snapshot_ref = table_entry->snapshot->snapshot->GetLockingRef();
-		auto engine = table_entry->snapshot->extern_engine.get();
+		auto engine = table_entry->snapshot->GetEngine();
 
 		// Kernel only refuses a path-based commit to a catalog-managed table at commit time, after the data files
 		// are written, so refuse it here instead.

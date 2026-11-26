@@ -194,7 +194,8 @@ static bool CatalogTypeIsSupported(CatalogType type) {
 shared_ptr<DeltaMultiFileList> DeltaSchemaEntry::CreateFileList(ClientContext &context, idx_t version,
                                                                 optional_ptr<const DeltaMultiFileList> old_snapshot) {
 	auto &delta_catalog = catalog.Cast<DeltaCatalog>();
-	auto snapshot = make_shared_ptr<DeltaMultiFileList>(context, delta_catalog.GetDBPath(), version, old_snapshot);
+	auto snapshot = make_shared_ptr<DeltaMultiFileList>(context, delta_catalog.GetDBPath(), version, old_snapshot,
+	                                                    delta_catalog.UseCachedSnapshot());
 
 	// Set log_tail and max_catalog_version for catalog-managed commits (CCV2) if available
 	if (!delta_catalog.catalog_log_tail.IsNull()) {
@@ -262,7 +263,7 @@ unique_ptr<DeltaTableEntry> DeltaSchemaEntry::CreateTableEntry(ClientContext &co
 	{
 		auto snapshot_ref = snapshot->snapshot->GetLockingRef();
 		ffi::visit_domain_metadata(
-		    snapshot_ref.GetPtr(), snapshot->extern_engine.get(), &table_info.tags,
+		    snapshot_ref.GetPtr(), snapshot->GetEngine(), &table_info.tags,
 		    [](ffi::NullableCvoid engine_context, ffi::KernelStringSlice domain, ffi::KernelStringSlice configuration) {
 			    auto &tags = *static_cast<InsertionOrderPreservingMap<string> *>(const_cast<void *>(engine_context));
 			    tags.insert({KernelUtils::FromDeltaString(domain), KernelUtils::FromDeltaString(configuration)});

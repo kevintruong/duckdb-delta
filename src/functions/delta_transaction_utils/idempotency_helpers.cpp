@@ -62,7 +62,7 @@ static void DeltaGetTransactionVersionFunction(ClientContext &context, TableFunc
 	auto kernel_snapshot = snapshot->snapshot->GetLockingRef();
 	auto app_id_kernel_string = KernelUtils::ToDeltaString(bind_data.app_id);
 	auto get_app_id_version_result =
-	    ffi::get_app_id_version(kernel_snapshot.GetPtr(), app_id_kernel_string, snapshot->extern_engine.get());
+	    ffi::get_app_id_version(kernel_snapshot.GetPtr(), app_id_kernel_string, snapshot->GetEngine());
 
 	ffi::OptionalValue<int64_t> version_opt;
 	auto unpacked_version_result = KernelUtils::TryUnpackResult(get_app_id_version_result, version_opt);
