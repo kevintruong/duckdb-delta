@@ -9,3 +9,13 @@ or
 ```bash
 make test_debug
 ```
+
+## Pinned S3 engine cache
+
+The proxy and connection-lifetime tests use a loopback S3 fixture. Run them with
+Python 3.11 or newer, a DuckDB package matching the built extension, and the
+`httpfs` extension installed.
+
+```sh
+DUCKDB_DELTA_EXTENSION=/path/to/delta.duckdb_extension python3 test/python/test_pinned_s3_engine_cache.py
+```

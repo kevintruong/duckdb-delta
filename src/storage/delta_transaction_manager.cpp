@@ -70,7 +70,7 @@ void DeltaTransactionManager::Checkpoint(ClientContext &context, bool force) {
 	auto snapshot_ref = table_entry.snapshot->snapshot->GetLockingRef();
 
 	auto checkpoint_result = table_entry.snapshot->TryUnpackKernelResult(
-	    ffi::checkpoint_snapshot(snapshot_ref.GetPtr(), table_entry.snapshot->extern_engine.get(), nullptr));
+	    ffi::checkpoint_snapshot(snapshot_ref.GetPtr(), table_entry.snapshot->GetEngine(), nullptr));
 	// Both result variants carry an owned snapshot handle (the pre-existing or newly-written
 	// snapshot) that we don't need here, but must still release.
 	if (checkpoint_result.tag == ffi::FfiCheckpointWriteResult::Tag::FfiCheckpointWriteResultWritten) {

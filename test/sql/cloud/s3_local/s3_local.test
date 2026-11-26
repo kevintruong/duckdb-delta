@@ -86,6 +86,57 @@ FROM delta_scan('s3://test-bucket/dat/all_primitive_types/delta')
 3
 4
 
+# A pinned scan keeps the Kernel engine alive across different pushed-down predicates.
+statement ok
+CALL enable_logging(level='debug', storage='memory');
+
+statement ok
+SET delta_kernel_logging=true;
+
+statement ok
+ATTACH 's3://test-bucket/dat/all_primitive_types/delta' AS pinned (TYPE delta, PIN_SNAPSHOT true, READ_ONLY);
+
+query I
+SELECT int32 FROM pinned WHERE int32 = 1;
+----
+1
+
+statement ok
+CALL truncate_duckdb_logs();
+
+query I
+SELECT int32 FROM pinned WHERE int32 = 3;
+----
+3
+
+query I
+SELECT int32 FROM pinned WHERE int32 = 4;
+----
+4
+
+query I
+SELECT count(*) FROM delta_filter_pushdown_log();
+----
+2
+
+query I
+SELECT count(*) FROM duckdb_logs
+WHERE type = 'DeltaKernel' AND message LIKE '%dropping engine interface%';
+----
+0
+
+statement ok
+DETACH pinned;
+
+statement ok
+RESET delta_kernel_logging;
+
+statement ok
+RESET enable_logging;
+
+statement ok
+CALL truncate_duckdb_logs();
+
 statement ok
 DROP SECRET S1;
 
